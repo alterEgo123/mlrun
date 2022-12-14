@@ -24,6 +24,12 @@ env_vars_opt = click.option(
     multiple=True,
     help="additional env vars, e.g. -e AWS_ACCESS_KEY_ID=<key-id>",
 )
+foreground_opt = click.option(
+    "--foreground",
+    is_flag=True,
+    default=False,
+    help="run process in the foreground (not as a daemon)",
+)
 
 
 @click.group()
@@ -40,20 +46,30 @@ def main():
 @click.option(
     "--artifact-path", "-a", help="default artifact path (if not in the data volume)"
 )
-@click.option("--background", "-b", is_flag=True, help="run in background process")
+@foreground_opt
 @click.option("--port", "-p", help="port to listen on", type=int)
 @env_vars_opt
 @env_file_opt
+@click.option("--force-local", is_flag=True, help="force use of local or docker mlrun")
 @click.option("--verbose", "-v", is_flag=True, help="verbose log")
 def start(
-    data_volume, logs_path, artifact_path, background, port, env_vars, env_file, verbose
+    data_volume, logs_path, artifact_path, foreground, port, env_vars, env_file, force_local, verbose
 ):
     """Start MLRun service, auto detect the best method (local/docker/k8s/remote)"""
+    current_env_vars = _get_mlrun_env(env_file)
+    last_deployment = current_env_vars.get("LAST_MLRUN_DEPLOYMENT", "")
+    if not force_local and (os.environ.get("V3IO_ACCESS_KEY", "") or last_deployment == "remote"):
+        dbpath = current_env_vars.get("MLRUN_DBPATH") or os.environ.get("MLRUN_DBPATH", "")
+        print(f"detected settings of remote MLRun service at {dbpath}")
+        return
+
+    # todo check if local and pid is alive
+    
     _local(
         data_volume,
         logs_path,
         artifact_path,
-        background,
+        foreground,
         port,
         env_vars,
         env_file,
@@ -69,20 +85,20 @@ def start(
 @click.option(
     "--artifact-path", "-a", help="default artifact path (if not in the data volume)"
 )
-@click.option("--background", "-b", is_flag=True, help="run in background process")
+@foreground_opt
 @click.option("--port", "-p", help="port to listen on", type=int)
 @env_vars_opt
 @env_file_opt
 @click.option("--verbose", "-v", is_flag=True, help="verbose log")
 def local(
-    data_volume, logs_path, artifact_path, background, port, env_vars, env_file, verbose
+    data_volume, logs_path, artifact_path, foreground, port, env_vars, env_file, verbose
 ):
     """Install MLRun service as a local process (limited, no UI and Nuclio)"""
     _local(
         data_volume,
         logs_path,
         artifact_path,
-        background,
+        foreground,
         port,
         env_vars,
         env_file,
@@ -91,14 +107,18 @@ def local(
 
 
 def _local(
-    data_volume, logs_path, artifact_path, background, port, env_vars, env_file, verbose
+    data_volume, logs_path, artifact_path, foreground, port, env_vars, env_file, verbose
 ):
     env = {"MLRUN_IGNORE_ENV_FILE": "true"}
     cmd = [sys.executable, "-m", "mlrun", "db"]
     data_volume = data_volume or os.environ.get("SHARED_DIR", "")
     artifact_path = artifact_path or os.environ.get("MLRUN_ARTIFACT_PATH", "")
 
-    if background:
+    if not port and "COLAB_RELEASE_TAG" in os.environ:
+        # change default port due to conflict in google colab
+        port = 8089
+
+    if not foreground:
         cmd += ["-b"]
     if port is not None:
         cmd += ["-p", str(port)]
@@ -121,7 +141,7 @@ def _local(
         {
             "MLRUN_DBPATH": f"http://localhost:{port or '8080'}",
             "MLRUN_MOCK_NUCLIO_DEPLOYMENT": "auto",
-            "LAST_MLRUN_CONFIG": "local",
+            "LAST_MLRUN_DEPLOYMENT": "local",
         },
         env_file=env_file,
         env_vars=env_vars,
@@ -135,7 +155,7 @@ def _local(
 @click.option(
     "--artifact-path", "-a", help="default artifact path (if not in the data volume)"
 )
-@click.option("--background", "-b", is_flag=True, help="run in background process")
+@foreground_opt
 @click.option("--port", "-p", help="MLRun port to listen on", type=int, default="8080")
 @env_vars_opt
 @env_file_opt
@@ -143,7 +163,7 @@ def _local(
 def docker(
     data_volume,
     artifact_path,
-    background,
+    foreground,
     port,
     env_vars,
     env_file,
@@ -175,7 +195,7 @@ def docker(
         env[key] = val
 
     cmd = ["docker-compose", "-f", compose_file, "up"]
-    if background:
+    if not foreground:
         cmd += ["-d"]
     child = subprocess.Popen(cmd, env=env)
     returncode = child.wait()
@@ -186,7 +206,7 @@ def docker(
         {
             "MLRUN_DBPATH": f"http://localhost:{port}",
             "MLRUN_MOCK_NUCLIO_DEPLOYMENT": "auto",
-            "LAST_MLRUN_CONFIG": "docker",
+            "LAST_MLRUN_DEPLOYMENT": "docker",
             "MLRUN_COMPOSE_PATH": compose_file,
         },
         env_file=env_file,
@@ -203,7 +223,7 @@ def docker(
 @env_vars_opt
 def remote(url, username, access_key, artifact_path, env_file, env_vars):
     """Connect to remote MLRun service (over Kubernetes)"""
-    config = {"MLRUN_DBPATH": url, "LAST_MLRUN_CONFIG": "remote"}
+    config = {"MLRUN_DBPATH": url, "LAST_MLRUN_DEPLOYMENT": "remote"}
     if artifact_path:
         config["V3IO_USERNAME"] = username
     if artifact_path:
@@ -337,12 +357,26 @@ def _set_mlrun_env(env_vars, env_file=None, env_vars_opt=None):
     return filename
 
 
+def _get_mlrun_env(env_file=None):
+    filename = os.path.expanduser(env_file or default_env_file)
+    return dotenv.dotenv_values(filename)
+
+
 def _has_docker():
     child = subprocess.Popen(
         ["docker", "ps"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     returncode = child.wait()
     return returncode == 0
+
+
+def _pid_exists(pid):
+    """Check whether pid exists in the current process table."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 compose_template = """
