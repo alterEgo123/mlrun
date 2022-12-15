@@ -1,5 +1,5 @@
 import os
-import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -53,18 +53,30 @@ def main():
 @click.option("--force-local", is_flag=True, help="force use of local or docker mlrun")
 @click.option("--verbose", "-v", is_flag=True, help="verbose log")
 def start(
-    data_volume, logs_path, artifact_path, foreground, port, env_vars, env_file, force_local, verbose
+    data_volume,
+    logs_path,
+    artifact_path,
+    foreground,
+    port,
+    env_vars,
+    env_file,
+    force_local,
+    verbose,
 ):
     """Start MLRun service, auto detect the best method (local/docker/k8s/remote)"""
     current_env_vars = _get_mlrun_env(env_file)
     last_deployment = current_env_vars.get("LAST_MLRUN_DEPLOYMENT", "")
-    if not force_local and (os.environ.get("V3IO_ACCESS_KEY", "") or last_deployment == "remote"):
-        dbpath = current_env_vars.get("MLRUN_DBPATH") or os.environ.get("MLRUN_DBPATH", "")
+    if not force_local and (
+        os.environ.get("V3IO_ACCESS_KEY", "") or last_deployment == "remote"
+    ):
+        dbpath = current_env_vars.get("MLRUN_DBPATH") or os.environ.get(
+            "MLRUN_DBPATH", ""
+        )
         print(f"detected settings of remote MLRun service at {dbpath}")
         return
 
     # todo check if local and pid is alive
-    
+
     _local(
         data_volume,
         logs_path,
@@ -75,6 +87,25 @@ def start(
         env_file,
         verbose,
     )
+
+
+@main.command()
+@env_file_opt
+def stop(env_file):
+    """Stop MLRun service which was started using the start command"""
+    current_env_vars = _get_mlrun_env(env_file)
+    last_deployment = current_env_vars.get("LAST_MLRUN_DEPLOYMENT", "")
+    if last_deployment == "local":
+        pid = current_env_vars.get("MLRUN_SERVICE_PID", "")
+        if pid:
+            os.kill(int(pid))
+    elif last_deployment == "docker":
+        compose_file = current_env_vars.get("MLRUN_COMPOSE_PATH", "")
+        if compose_file:
+            child = subprocess.Popen(["docker-compose", "-f", compose_file, "down"])
+            returncode = child.wait()
+            if returncode != 0:
+                raise SystemExit(returncode)
 
 
 @main.command()
@@ -110,7 +141,6 @@ def _local(
     data_volume, logs_path, artifact_path, foreground, port, env_vars, env_file, verbose
 ):
     env = {"MLRUN_IGNORE_ENV_FILE": "true"}
-    cmd = [sys.executable, "-m", "mlrun", "db"]
     data_volume = data_volume or os.environ.get("SHARED_DIR", "")
     artifact_path = artifact_path or os.environ.get("MLRUN_ARTIFACT_PATH", "")
 
@@ -118,6 +148,8 @@ def _local(
         # change default port due to conflict in google colab
         port = 8089
 
+    cmd = [sys.executable, "-m", "mlrun", "db"]
+    cmd += ["--update-env", env_file or default_env_file]
     if not foreground:
         cmd += ["-b"]
     if port is not None:
@@ -144,13 +176,18 @@ def _local(
             "LAST_MLRUN_DEPLOYMENT": "local",
         },
         env_file=env_file,
-        env_vars=env_vars,
+        env_vars_opt=env_vars,
     )
 
 
 @main.command()
+@click.option("--jupyter", "-j", is_flag=True, help="deploy Jupyter container")
 @click.option(
     "--data-volume", "-d", help="path prefix to the location of db and artifacts"
+)
+@click.option(
+    "--host-mnt-path",
+    help="host mount path (of the data-volume), when different from the data volume path",
 )
 @click.option(
     "--artifact-path", "-a", help="default artifact path (if not in the data volume)"
@@ -159,59 +196,78 @@ def _local(
 @click.option("--port", "-p", help="MLRun port to listen on", type=int, default="8080")
 @env_vars_opt
 @env_file_opt
+@click.option("--tag", help="MLRun version tag")
 @click.option("--compose-file", help="path to save the generated compose.yaml file")
 def docker(
+    jupyter,
     data_volume,
+    host_mnt_path,
     artifact_path,
     foreground,
     port,
     env_vars,
     env_file,
+    tag,
     compose_file,
 ):
     """Deploy mlrun and nuclio services using Docker compose"""
     if not _has_docker():
         print(
-            "Docker command not detected on this system, use local or remore service options"
+            "Docker command not detected on this system, use local or remore service options instead"
         )
         raise SystemExit(1)
 
-    compose_body = compose_template
-    compose_file = compose_file or "compose.yaml"
-    with open(compose_file, "w") as fp:
-        fp.write(compose_body)
-
+    is_codespaces = False  # todo: detect from env
+    if is_codespaces:
+        data_volume = data_volume or "/tmp/mlrun"
+        host_mnt_path = host_mnt_path or "/mnt/containerTmp/mlrun"
     data_volume = os.path.realpath(os.path.expanduser(data_volume or "~/mlrun-data"))
-    host_mnt_dir = data_volume
+    host_mnt_path = _docker_path(host_mnt_path or data_volume)
     os.makedirs(data_volume, exist_ok=True)
 
     env = os.environ.copy()
     for key, val in {
         "HOST_IP": _get_ip(),
         "SHARED_DIR": data_volume,
-        "HOST_MNT_DIR": host_mnt_dir,
+        "HOST_MNT_DIR": host_mnt_path,
         "MLRUN_PORT": str(port),
     }.items():
+        print(f"{key}={val}")
         env[key] = val
+    if tag:
+        env["TAG"] = tag
+    print(env.keys())
 
+    compose_file = compose_file or "compose.yaml"
     cmd = ["docker-compose", "-f", compose_file, "up"]
     if not foreground:
         cmd += ["-d"]
-    child = subprocess.Popen(cmd, env=env)
-    returncode = child.wait()
-    if returncode != 0:
-        raise SystemExit(returncode)
 
-    env_file = _set_mlrun_env(
+    compose_body = compose_template
+    # todo: modify/add elements ..
+    compose_body += jupyter_with_api_template if jupyter else mlrun_api_template
+    compose_body += suffix_template
+    if jupyter:
+        compose_body = compose_body.replace("http://mlrun-api", "http://jupyter")
+    with open(compose_file, "w") as fp:
+        fp.write(compose_body)
+
+    _set_mlrun_env(
         {
             "MLRUN_DBPATH": f"http://localhost:{port}",
-            "MLRUN_MOCK_NUCLIO_DEPLOYMENT": "auto",
+            "MLRUN_MOCK_NUCLIO_DEPLOYMENT": "",
             "LAST_MLRUN_DEPLOYMENT": "docker",
             "MLRUN_COMPOSE_PATH": compose_file,
         },
         env_file=env_file,
-        env_vars=env_vars,
+        env_vars_opt=env_vars,
     )
+
+    print(cmd)
+    child = subprocess.Popen(cmd, env=env)
+    returncode = child.wait()
+    if returncode != 0:
+        raise SystemExit(returncode)
 
 
 @main.command()
@@ -230,7 +286,7 @@ def remote(url, username, access_key, artifact_path, env_file, env_vars):
         config["V3IO_ACCESS_KEY"] = access_key
     if artifact_path:
         config["MLRUN_ARTIFACT_PATH"] = artifact_path
-    _set_mlrun_env(config, env_file=env_file, env_vars=env_vars)
+    _set_mlrun_env(config, env_file=env_file, env_vars_opt=env_vars)
 
 
 @main.command()
@@ -263,7 +319,7 @@ def set(api, username, access_key, artifact_path, env_file, env_vars):
         "V3IO_USERNAME": username,
         "V3IO_ACCESS_KEY": access_key,
     }
-    _set_mlrun_env(env_dict, env_file=env_file, env_vars=env_vars)
+    _set_mlrun_env(env_dict, env_file=env_file, env_vars_opt=env_vars)
 
 
 @main.command()
@@ -370,6 +426,13 @@ def _has_docker():
     return returncode == 0
 
 
+def _docker_path(filepath: str):
+    if re.match(r"^[a-zA-Z]:\\.?", filepath):
+        # convert windows paths to docker style
+        filepath = "/" + filepath[0].lower() + filepath[2:].replace("\\", "/")
+    return filepath
+
+
 def _pid_exists(pid):
     """Check whether pid exists in the current process table."""
     try:
@@ -420,6 +483,34 @@ services:
     volumes:
       - nuclio-platform-config:/etc/nuclio/config
 
+  mlrun-ui:
+    image: "mlrun/mlrun-ui:${TAG:-1.2.0}"
+    ports:
+      - "8060:8090"
+    environment:
+      MLRUN_API_PROXY_URL: http://mlrun-api:8080
+      MLRUN_NUCLIO_MODE: enable
+      MLRUN_NUCLIO_API_URL: http://nuclio:8070
+      MLRUN_NUCLIO_UI_URL: http://localhost:${NUCLIO_PORT:-8070}
+    networks:
+      - mlrun
+
+  nuclio:
+    image: "quay.io/nuclio/dashboard:${NUCLIO_TAG:-stable-amd64}"
+    ports:
+      - "8070:8070"
+    environment:
+      NUCLIO_DASHBOARD_EXTERNAL_IP_ADDRESSES: "${HOST_IP}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - nuclio-platform-config:/etc/nuclio/config
+    depends_on:
+      - init_nuclio
+    networks:
+      - mlrun
+"""
+
+mlrun_api_template = """
   mlrun-api:
     image: "mlrun/mlrun-api:${TAG:-1.2.0}"
     ports:
@@ -438,36 +529,49 @@ services:
       # let mlrun control nuclio resources
       MLRUN_HTTPDB__PROJECTS__FOLLOWERS: "nuclio"
     volumes:
-      - "${HOST_MNT_DIR:?err}:/data"
+      - "${HOST_MNT_DIR}:/data"
     networks:
       - mlrun
+"""
 
-  mlrun-ui:
-    image: "mlrun/mlrun-ui:${TAG:-1.2.0}"
+jupyter_with_api_template = """
+  jupyter:
+    image: "mlrun/jupyter:${TAG:-1.2.0}"
     ports:
-      - "{MLRUN_UI_PORT:-8060}:8090"
+      - "${MLRUN_PORT:-8080}:8080"
+      - "8888:8888"
     environment:
-      MLRUN_API_PROXY_URL: http://mlrun-api:8080
-      MLRUN_NUCLIO_MODE: enable
-      MLRUN_NUCLIO_API_URL: http://nuclio:8070
-      MLRUN_NUCLIO_UI_URL: http://localhost:${NUCLIO_PORT:-8070}
-    networks:
-      - mlrun
-
-  nuclio:
-    image: "quay.io/nuclio/dashboard:${NUCLIO_TAG:-stable-amd64}"
-    ports:
-      - "${NUCLIO_PORT:-8070}:8070"
-    environment:
-      NUCLIO_DASHBOARD_EXTERNAL_IP_ADDRESSES: "${HOST_IP}"
+      MLRUN_ARTIFACT_PATH: "/home/jovyan/data/{{project}}"
+      MLRUN_NUCLIO_DASHBOARD_URL: http://nuclio:8070
+      MLRUN_HTTPDB__DSN: "sqlite:////home/jovyan/data/mlrun.db?check_same_thread=false"
+      MLRUN_UI__URL: http://localhost:8060
+      # using local storage, meaning files / artifacts are stored locally, so we want to allow access to them
+      MLRUN_HTTPDB__REAL_PATH: "/home/jovyan/data"
+      # not running on k8s meaning no need to store secrets
+      MLRUN_SECRET_STORES__KUBERNETES__AUTO_ADD_PROJECT_SECRETS: "false"
+      # let mlrun control nuclio resources
+      MLRUN_HTTPDB__PROJECTS__FOLLOWERS: "nuclio"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - nuclio-platform-config:/etc/nuclio/config
-    depends_on:
-      - init_nuclio
+      - "${HOST_MNT_DIR}:/home/jovyan/data"
     networks:
       - mlrun
+"""
 
+jupyter_template = """
+  jupyter:
+    image: "mlrun/jupyter:${TAG:-1.2.0}"
+    ports:
+      - "8888:8888"
+    environment:
+      MLRUN_ARTIFACT_PATH: "/home/jovyan/data/{{project}}"
+      MLRUN_DBPATH: http://mlrun-api:${MLRUN_PORT:-8080}
+    volumes:
+      - "${SHARED_DIR}:/home/jovyan/data"
+    networks:
+      - mlrun
+"""
+
+suffix_template = """
 volumes:
   nuclio-platform-config: {}
 
