@@ -112,6 +112,7 @@ def stop(env_file, del_env_file):
             child = subprocess.Popen(["docker-compose", "-f", compose_file, "down"])
             returncode = child.wait()
             if returncode != 0:
+                _set_mlrun_env({"MLRUN_DBPATH": ""}, env_file)  # disable the DB access
                 raise SystemExit(returncode)
         _clear_mlrun_env(env_file, del_env_file)
 
@@ -176,6 +177,8 @@ def _local(
     returncode = child.wait()
     if returncode != 0:
         raise SystemExit(returncode)
+
+    # todo: wait to see the db is up
 
     _set_mlrun_env(
         {
@@ -265,7 +268,7 @@ def docker(
             "MLRUN_DBPATH": f"http://localhost:{port}",
             "MLRUN_MOCK_NUCLIO_DEPLOYMENT": "",
             "LAST_MLRUN_DEPLOYMENT": "docker",
-            "MLRUN_COMPOSE_PATH": compose_file,
+            "MLRUN_COMPOSE_PATH": os.path.realpath(compose_file),
         },
         env_file=env_file,
         env_vars_opt=env_vars,
@@ -583,7 +586,13 @@ jupyter_with_api_template = """
 jupyter_template = """
   jupyter:
     image: "mlrun/jupyter:${TAG:-1.2.0}"
-    command: ["start-notebook.sh", "--ip='0.0.0.0'", "--port=8888", "--NotebookApp.token=''", "--NotebookApp.password=''", "--NotebookApp.default_url='/lab'"]
+    command:
+      - start-notebook.sh
+      - "--ip='0.0.0.0'"
+      - --port=8888
+      - "--NotebookApp.token=''"
+      - "--NotebookApp.password=''"
+      - "--NotebookApp.default_url='/lab'"
     ports:
       - "8888:8888"
     environment:
