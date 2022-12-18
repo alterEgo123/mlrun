@@ -40,7 +40,7 @@ def main():
 
 @main.command()
 @click.option(
-    "--data-volume", "-d", help="path prefix to the location of db and artifacts"
+    "--data-volume", "-d", help="host path prefix to the location of db and artifacts"
 )
 @click.option("--logs-path", "-l", help="logs directory path")
 @click.option(
@@ -91,14 +91,21 @@ def start(
 
 @main.command()
 @env_file_opt
-def stop(env_file):
+@click.option(
+    "--del-env-file",
+    "-d",
+    is_flag=True,
+    help="delete the specified or default env file",
+)
+def stop(env_file, del_env_file):
     """Stop MLRun service which was started using the start command"""
     current_env_vars = _get_mlrun_env(env_file)
     last_deployment = current_env_vars.get("LAST_MLRUN_DEPLOYMENT", "")
     if last_deployment == "local":
-        pid = current_env_vars.get("MLRUN_SERVICE_PID", "")
-        if pid:
-            os.kill(int(pid))
+        pid = int(current_env_vars.get("MLRUN_SERVICE_PID", "0"))
+        if pid and _pid_exists(pid):
+            os.kill(pid)
+        _clear_mlrun_env(env_file, del_env_file)
     elif last_deployment == "docker":
         compose_file = current_env_vars.get("MLRUN_COMPOSE_PATH", "")
         if compose_file:
@@ -106,11 +113,12 @@ def stop(env_file):
             returncode = child.wait()
             if returncode != 0:
                 raise SystemExit(returncode)
+        _clear_mlrun_env(env_file, del_env_file)
 
 
 @main.command()
 @click.option(
-    "--data-volume", "-d", help="path prefix to the location of db and artifacts"
+    "--data-volume", "-d", help="host path prefix to the location of db and artifacts"
 )
 @click.option("--logs-path", "-l", help="logs directory path")
 @click.option(
@@ -183,11 +191,11 @@ def _local(
 @main.command()
 @click.option("--jupyter", "-j", is_flag=True, help="deploy Jupyter container")
 @click.option(
-    "--data-volume", "-d", help="path prefix to the location of db and artifacts"
+    "--data-volume", "-d", help="host path prefix to the location of db and artifacts"
 )
 @click.option(
-    "--host-mnt-path",
-    help="host mount path (of the data-volume), when different from the data volume path",
+    "--volume-mount",
+    help="container mount path (of the data-volume), when different from host data volume path",
 )
 @click.option(
     "--artifact-path", "-a", help="default artifact path (if not in the data volume)"
@@ -201,7 +209,7 @@ def _local(
 def docker(
     jupyter,
     data_volume,
-    host_mnt_path,
+    volume_mount,
     artifact_path,
     foreground,
     port,
@@ -219,36 +227,36 @@ def docker(
 
     is_codespaces = False  # todo: detect from env
     if is_codespaces:
-        data_volume = data_volume or "/tmp/mlrun"
-        host_mnt_path = host_mnt_path or "/mnt/containerTmp/mlrun"
+        volume_mount = volume_mount or "/tmp/mlrun"
+        data_volume = data_volume or "/mnt/containerTmp/mlrun"
     data_volume = os.path.realpath(os.path.expanduser(data_volume or "~/mlrun-data"))
-    host_mnt_path = _docker_path(host_mnt_path or data_volume)
+    volume_mount = volume_mount or _docker_path(data_volume)
     os.makedirs(data_volume, exist_ok=True)
 
     env = os.environ.copy()
     for key, val in {
         "HOST_IP": _get_ip(),
-        "SHARED_DIR": data_volume,
-        "HOST_MNT_DIR": host_mnt_path,
+        "SHARED_DIR": _docker_path(data_volume),  # host dir
+        "VOLUME_MOUNT": volume_mount,  # mounted dir
         "MLRUN_PORT": str(port),
     }.items():
         print(f"{key}={val}")
         env[key] = val
     if tag:
         env["TAG"] = tag
-    print(env.keys())
 
     compose_file = compose_file or "compose.yaml"
     cmd = ["docker-compose", "-f", compose_file, "up"]
     if not foreground:
         cmd += ["-d"]
 
-    compose_body = compose_template
+    compose_body = compose_template + mlrun_api_template
     # todo: modify/add elements ..
-    compose_body += jupyter_with_api_template if jupyter else mlrun_api_template
-    compose_body += suffix_template
+    # compose_body += jupyter_with_api_template if jupyter else mlrun_api_template
     if jupyter:
-        compose_body = compose_body.replace("http://mlrun-api", "http://jupyter")
+        # compose_body = compose_body.replace("http://mlrun-api", "http://jupyter")
+        compose_body += jupyter_template
+    compose_body += suffix_template
     with open(compose_file, "w") as fp:
         fp.write(compose_body)
 
@@ -413,6 +421,20 @@ def _set_mlrun_env(env_vars, env_file=None, env_vars_opt=None):
     return filename
 
 
+def _clear_mlrun_env(env_file, delete_file=None):
+    filename = os.path.expanduser(env_file or default_env_file)
+    if os.path.isfile(filename):
+        if delete_file:
+            os.remove(filename)
+        else:
+            for key in [
+                "MLRUN_DBPATH",
+                "LAST_MLRUN_DEPLOYMENT",
+                "MLRUN_MOCK_NUCLIO_DEPLOYMENT",
+            ]:
+                dotenv.unset_key(filename, key)
+
+
 def _get_mlrun_env(env_file=None):
     filename = os.path.expanduser(env_file or default_env_file)
     return dotenv.dotenv_values(filename)
@@ -465,10 +487,10 @@ services:
             - volume:
                 name: mlrun-stuff
                 hostPath:
-                  path: ${HOST_MNT_DIR}
+                  path: ${SHARED_DIR}
               volumeMount:
                 name: mlrun-stuff
-                mountPath: ${SHARED_DIR}
+                mountPath: ${VOLUME_MOUNT}
         logger:
           sinks:
             myStdoutLoggerSink:
@@ -516,10 +538,10 @@ mlrun_api_template = """
     ports:
       - "${MLRUN_PORT:-8080}:8080"
     environment:
-      MLRUN_ARTIFACT_PATH: "${SHARED_DIR}/{{project}}"
+      MLRUN_ARTIFACT_PATH: "${VOLUME_MOUNT}/{{project}}"
       # using local storage, meaning files / artifacts are stored locally, so we want to allow access to them
       MLRUN_HTTPDB__REAL_PATH: /data
-      MLRUN_HTTPDB__DATA_VOLUME: "${SHARED_DIR}"
+      MLRUN_HTTPDB__DATA_VOLUME: "${VOLUME_MOUNT}"
       MLRUN_LOG_LEVEL: DEBUG
       MLRUN_NUCLIO_DASHBOARD_URL: http://nuclio:${NUCLIO_PORT:-8070}
       MLRUN_HTTPDB__DSN: "sqlite:////data/mlrun.db?check_same_thread=false"
@@ -529,11 +551,12 @@ mlrun_api_template = """
       # let mlrun control nuclio resources
       MLRUN_HTTPDB__PROJECTS__FOLLOWERS: "nuclio"
     volumes:
-      - "${HOST_MNT_DIR}:/data"
+      - "${SHARED_DIR}:/data"
     networks:
       - mlrun
 """
 
+# currently broken !! (VOLUME_MOUNT must eq /home/jovyan/data)
 jupyter_with_api_template = """
   jupyter:
     image: "mlrun/jupyter:${TAG:-1.2.0}"
@@ -546,13 +569,13 @@ jupyter_with_api_template = """
       MLRUN_HTTPDB__DSN: "sqlite:////home/jovyan/data/mlrun.db?check_same_thread=false"
       MLRUN_UI__URL: http://localhost:8060
       # using local storage, meaning files / artifacts are stored locally, so we want to allow access to them
-      MLRUN_HTTPDB__REAL_PATH: "/home/jovyan/data"
+      MLRUN_HTTPDB__REAL_PATH: /home/jovyan/data
       # not running on k8s meaning no need to store secrets
       MLRUN_SECRET_STORES__KUBERNETES__AUTO_ADD_PROJECT_SECRETS: "false"
       # let mlrun control nuclio resources
       MLRUN_HTTPDB__PROJECTS__FOLLOWERS: "nuclio"
     volumes:
-      - "${HOST_MNT_DIR}:/home/jovyan/data"
+      - "${SHARED_DIR}:/home/jovyan/data"
     networks:
       - mlrun
 """
@@ -560,13 +583,13 @@ jupyter_with_api_template = """
 jupyter_template = """
   jupyter:
     image: "mlrun/jupyter:${TAG:-1.2.0}"
+    command: ["start-notebook.sh", "--ip='0.0.0.0'", "--port=8888", "--NotebookApp.token=''", "--NotebookApp.password=''", "--NotebookApp.default_url='/lab'"]
     ports:
       - "8888:8888"
     environment:
-      MLRUN_ARTIFACT_PATH: "/home/jovyan/data/{{project}}"
       MLRUN_DBPATH: http://mlrun-api:${MLRUN_PORT:-8080}
     volumes:
-      - "${SHARED_DIR}:/home/jovyan/data"
+      - "${SHARED_DIR}:${VOLUME_MOUNT}"
     networks:
       - mlrun
 """
@@ -579,6 +602,7 @@ networks:
   mlrun:
     name: mlrun
 """
+
 
 if __name__ == "__main__":
     main()
